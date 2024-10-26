@@ -1,16 +1,31 @@
 ;; MementoChain - Decentralized Memory Sharing Platform
 ;; Written in Clarity for Stacks blockchain
 
-;; Constants
-(define-constant contract-owner tx-sender)
+;; Error codes
 (define-constant err-owner-only (err u100))
 (define-constant err-already-claimed (err u101))
 (define-constant err-not-unlocked (err u102))
 (define-constant err-invalid-memory (err u103))
+(define-constant err-memory-locked (err u104))
+(define-constant err-invalid-unlock-delay (err u105))
+(define-constant err-invalid-title-length (err u106))
+(define-constant err-invalid-description-length (err u107))
+(define-constant err-invalid-memory-type (err u108))
+(define-constant err-memory-deleted (err u109))
+(define-constant err-self-transfer (err u110))
+
+;; Constants
+(define-constant contract-owner tx-sender)
+(define-constant max-title-length u64)
+(define-constant max-description-length u256)
+(define-constant min-unlock-delay u1)
+(define-constant max-unlock-delay u52560) ;; Approximately 1 year in blocks
+(define-constant memory-types (list "text" "photo" "audio"))
 
 ;; Data Variables
 (define-data-var total-memories uint u0)
 (define-data-var random-seed uint u1)
+(define-data-var contract-paused bool false)
 
 ;; Define memory structure
 (define-map memories uint {
@@ -19,55 +34,118 @@
     unlock-height: uint,
     is-anonymous: bool,
     is-claimed: bool,
-    recipient: (optional principal)
+    is-deleted: bool,
+    recipient: (optional principal),
+    likes: uint,
+    reports: uint
 })
 
 ;; Define memory metadata
 (define-map memory-metadata uint {
     title: (string-utf8 64),
     description: (string-utf8 256),
-    memory-type: (string-utf8 16),  ;; "text", "photo", "audio"
-    creation-height: uint
+    memory-type: (string-utf8 16),
+    creation-height: uint,
+    last-modified: uint,
+    tags: (list 5 (string-utf8 32))
 })
+
+;; User interaction tracking
+(define-map user-interactions principal {
+    memories-created: uint,
+    memories-claimed: uint,
+    likes-given: uint
+})
+
+;; Memory likes tracking
+(define-map memory-likes (tuple (memory-id uint) (user principal)) bool)
+
+;; Private functions
+(define-private (is-valid-memory-type (memory-type (string-utf8 16)))
+    (asserts! (is-some (index-of memory-types memory-type)) (err err-invalid-memory-type)))
+
+(define-private (validate-memory-params 
+    (title (string-utf8 64))
+    (description (string-utf8 256))
+    (memory-type (string-utf8 16))
+    (unlock-delay uint))
+    (begin
+        (asserts! (<= (len title) max-title-length) (err err-invalid-title-length))
+        (asserts! (<= (len description) max-description-length) (err err-invalid-description-length))
+        (asserts! (and (>= unlock-delay min-unlock-delay) (<= unlock-delay max-unlock-delay)) (err err-invalid-unlock-delay))
+        (is-valid-memory-type memory-type)))
+
+(define-private (update-user-stats (user principal) (action (string-utf8 16)))
+    (let ((current-stats (default-to 
+            { memories-created: u0, memories-claimed: u0, likes-given: u0 }
+            (map-get? user-interactions user))))
+        (match action
+            "create" (map-set user-interactions user (merge current-stats { memories-created: (+ (get memories-created current-stats) u1) }))
+            "claim" (map-set user-interactions user (merge current-stats { memories-claimed: (+ (get memories-claimed current-stats) u1) }))
+            "like" (map-set user-interactions user (merge current-stats { likes-given: (+ (get likes-given current-stats) u1) }))
+            false)))
 
 ;; Public functions
 
-;; Create a new memory
-(define-public (create-memory (content-hash (string-utf8 256)) 
-                            (title (string-utf8 64))
-                            (description (string-utf8 256))
-                            (memory-type (string-utf8 16))
-                            (unlock-delay uint)
-                            (is-anonymous bool)
-                            (recipient (optional principal)))
-    (let ((memory-id (var-get total-memories))
-          (unlock-height (+ block-height unlock-delay)))
-        
-        ;; Store memory data
-        (map-set memories memory-id {
-            creator: tx-sender,
-            content-hash: content-hash,
-            unlock-height: unlock-height,
-            is-anonymous: is-anonymous,
-            is-claimed: false,
-            recipient: recipient
-        })
-        
-        ;; Store metadata
-        (map-set memory-metadata memory-id {
-            title: title,
-            description: description,
-            memory-type: memory-type,
-            creation-height: block-height
-        })
-        
-        ;; Increment total memories
-        (var-set total-memories (+ memory-id u1))
-        (ok memory-id)))
+;; Contract management
+(define-public (toggle-contract-pause)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        (ok (var-set contract-paused (not (var-get contract-paused))))))
 
-;; Claim a memory (for time-locked or targeted memories)
+;; Create a new memory
+(define-public (create-memory 
+    (content-hash (string-utf8 256)) 
+    (title (string-utf8 64))
+    (description (string-utf8 256))
+    (memory-type (string-utf8 16))
+    (unlock-delay uint)
+    (is-anonymous bool)
+    (recipient (optional principal))
+    (tags (list 5 (string-utf8 32))))
+    
+    (begin
+        (asserts! (not (var-get contract-paused)) (err u1))
+        (try! (validate-memory-params title description memory-type unlock-delay))
+        
+        (let ((memory-id (var-get total-memories))
+              (unlock-height (+ block-height unlock-delay)))
+            
+            ;; Store memory data
+            (map-set memories memory-id {
+                creator: tx-sender,
+                content-hash: content-hash,
+                unlock-height: unlock-height,
+                is-anonymous: is-anonymous,
+                is-claimed: false,
+                is-deleted: false,
+                recipient: recipient,
+                likes: u0,
+                reports: u0
+            })
+            
+            ;; Store metadata
+            (map-set memory-metadata memory-id {
+                title: title,
+                description: description,
+                memory-type: memory-type,
+                creation-height: block-height,
+                last-modified: block-height,
+                tags: tags
+            })
+            
+            ;; Update stats
+            (update-user-stats tx-sender "create")
+            
+            ;; Increment total memories
+            (var-set total-memories (+ memory-id u1))
+            (ok memory-id))))
+
+;; Claim a memory
 (define-public (claim-memory (memory-id uint))
     (let ((memory (unwrap! (map-get? memories memory-id) (err err-invalid-memory))))
+        (asserts! (not (var-get contract-paused)) (err u1))
+        (asserts! (not (get is-deleted memory)) (err err-memory-deleted))
         (asserts! (>= block-height (get unlock-height memory)) (err err-not-unlocked))
         (asserts! (not (get is-claimed memory)) (err err-already-claimed))
         (asserts! (or
@@ -75,14 +153,53 @@
             (is-eq (some tx-sender) (get recipient memory)))
             (err err-owner-only))
         
-        ;; Mark as claimed
+        ;; Mark as claimed and update stats
         (map-set memories memory-id (merge memory { is-claimed: true }))
+        (update-user-stats tx-sender "claim")
+        (ok true)))
+
+;; Like a memory
+(define-public (like-memory (memory-id uint))
+    (let ((memory (unwrap! (map-get? memories memory-id) (err err-invalid-memory)))
+          (like-key {memory-id: memory-id, user: tx-sender}))
+        (asserts! (not (var-get contract-paused)) (err u1))
+        (asserts! (not (get is-deleted memory)) (err err-memory-deleted))
+        (asserts! (>= block-height (get unlock-height memory)) (err err-not-unlocked))
+        (asserts! (is-none (map-get? memory-likes like-key)) (err err-already-claimed))
+        
+        ;; Update likes count and record user interaction
+        (map-set memories memory-id (merge memory { likes: (+ (get likes memory) u1) }))
+        (map-set memory-likes like-key true)
+        (update-user-stats tx-sender "like")
+        (ok true)))
+
+;; Report inappropriate content
+(define-public (report-memory (memory-id uint))
+    (let ((memory (unwrap! (map-get? memories memory-id) (err err-invalid-memory))))
+        (asserts! (not (var-get contract-paused)) (err u1))
+        (asserts! (not (get is-deleted memory)) (err err-memory-deleted))
+        
+        ;; Increment report count
+        (map-set memories memory-id (merge memory { reports: (+ (get reports memory) u1) }))
+        (ok true)))
+
+;; Delete memory (only creator or contract owner)
+(define-public (delete-memory (memory-id uint))
+    (let ((memory (unwrap! (map-get? memories memory-id) (err err-invalid-memory))))
+        (asserts! (or 
+            (is-eq tx-sender (get creator memory))
+            (is-eq tx-sender contract-owner))
+            (err err-owner-only))
+        
+        (map-set memories memory-id (merge memory { is-deleted: true }))
         (ok true)))
 
 ;; Get a random unclaimed memory
 (define-public (get-random-memory)
     (let ((current-seed (var-get random-seed))
           (total (var-get total-memories)))
+        
+        (asserts! (not (var-get contract-paused)) (err u1))
         
         ;; Update random seed
         (var-set random-seed (+ current-seed block-height))
@@ -96,6 +213,7 @@
 ;; Get memory details if unlocked
 (define-read-only (get-memory-details (memory-id uint))
     (let ((memory (unwrap! (map-get? memories memory-id) (err err-invalid-memory))))
+        (asserts! (not (get is-deleted memory)) (err err-memory-deleted))
         (if (>= block-height (get unlock-height memory))
             (ok {
                 memory: memory,
@@ -103,6 +221,16 @@
             })
             (err err-not-unlocked))))
 
+;; Get user statistics
+(define-read-only (get-user-stats (user principal))
+    (ok (default-to 
+        { memories-created: u0, memories-claimed: u0, likes-given: u0 }
+        (map-get? user-interactions user))))
+
 ;; Get total number of memories
 (define-read-only (get-total-memories)
     (ok (var-get total-memories)))
+
+;; Check if memory is liked by user
+(define-read-only (is-memory-liked-by-user (memory-id uint) (user principal))
+    (ok (is-some (map-get? memory-likes {memory-id: memory-id, user: user}))))
